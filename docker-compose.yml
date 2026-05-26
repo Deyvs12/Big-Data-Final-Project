@@ -1,10 +1,12 @@
-version: '3.8'
-
 # ─────────────────────────────────────────
 #  ANCHORS
 # ─────────────────────────────────────────
 x-spark-worker: &spark-worker
-  image: bitnami/spark:3.5
+  image: bitnamilegacy/spark:3.5.1
+  # Run as host UID so writes to the bind-mounted ./data land with correct
+  # ownership. GID 0 (root) preserves access to bitnami's internal dirs
+  # which are group-writable to gid=0.
+  user: "${HOST_UID:-1000}:0"
   environment:
     - SPARK_MODE=worker
     - SPARK_MASTER_URL=spark://mobility-spark-master:7077
@@ -23,7 +25,15 @@ x-spark-worker: &spark-worker
     - mobility-net
 
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.9.1-python3.11
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  image: mobility-airflow:2.9.1
+  # Match host UID so the Spark driver (running in this container in client
+  # mode) can write to the bind-mounted ./data directory. GID 0 keeps access
+  # to bitnami's group-writable internal dirs. This is the pattern used in
+  # Airflow's official docker-compose quickstart.
+  user: "${HOST_UID:-1000}:0"
   environment:
     - AIRFLOW__CORE__EXECUTOR=LocalExecutor
     - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@mobility-postgres/airflow
@@ -37,10 +47,15 @@ x-airflow-common: &airflow-common
     - MONGO_URI=mongodb://admin:admin@mobility-mongodb:27017/
   volumes:
     - ./airflow/dags:/opt/airflow/dags
-    - ./airflow/logs:/opt/airflow/logs
+    - mobility-airflow-logs:/opt/airflow/logs
     - ./airflow/plugins:/opt/airflow/plugins
     - ./jobs:/opt/airflow/jobs
     - ./data:/opt/airflow/data
+    # Mirror Spark cluster paths so the driver (running in this container
+    # in --master client mode) resolves the same absolute paths the workers
+    # see. Required by SparkSubmitOperator -> spark.read on these inputs.
+    - ./jobs:/opt/bitnami/spark/jobs
+    - ./data:/opt/bitnami/spark/data
   depends_on:
     mobility-postgres:
       condition: service_healthy
@@ -54,9 +69,10 @@ services:
 
   # ── Spark Cluster ──────────────────────────────────────────
   mobility-spark-master:
-    image: bitnami/spark:3.5
+    image: bitnamilegacy/spark:3.5.1
     container_name: mobility-spark-master
     hostname: mobility-spark-master
+    user: "${HOST_UID:-1000}:0"
     environment:
       - SPARK_MODE=master
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
@@ -114,11 +130,13 @@ services:
   mobility-airflow-init:
     <<: *airflow-common
     container_name: mobility-airflow-init
-    entrypoint: /bin/bash
+    # NOTE: do not override the official /entrypoint -- it adds the runtime
+    # UID to /etc/passwd, which Airflow CLI requires (getuser()).
     command:
+      - bash
       - -c
       - |
-        pip install apache-airflow-providers-apache-spark pymongo --quiet
+        set -e
         airflow db migrate
         airflow users create \
           --username admin \
@@ -127,6 +145,10 @@ services:
           --role Admin \
           --email admin@local.dev \
           --password admin || true
+        airflow connections add spark_default \
+          --conn-type spark \
+          --conn-host spark://mobility-spark-master \
+          --conn-port 7077 || true
         echo "Init complete"
     restart: on-failure
 
@@ -220,6 +242,7 @@ services:
 volumes:
   mobility-postgres-data:
   mobility-mongo-data:
+  mobility-airflow-logs:
 
 networks:
   mobility-net:

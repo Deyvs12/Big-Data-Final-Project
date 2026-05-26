@@ -48,6 +48,38 @@ PAYMENT_TYPE_MAP = {
     "6": "app",
 }
 
+# TLC retroactively republished pre-2016-07 parquets with PULocationID /
+# DOLocationID instead of pickup/dropoff lon-lat. The project schema requires
+# lat/lon, so when only LocationIDs are present we synthesize deterministic
+# coordinates inside a rough NYC bounding box.
+NYC_LON_MIN, NYC_LON_MAX = -74.25, -73.70
+NYC_LAT_MIN, NYC_LAT_MAX = 40.50, 40.92
+
+
+def _coord_from_id(id_col, salt: str, lo: float, hi: float):
+    """Deterministic float in [lo, hi) from an integer column + salt string."""
+    bucket = F.pmod(
+        F.hash(F.concat(F.col(id_col).cast(StringType()), F.lit(salt))),
+        F.lit(1_000_000),
+    )
+    return F.lit(lo) + (bucket / F.lit(1_000_000.0)) * F.lit(hi - lo)
+
+
+def synthesize_coords(df):
+    """Add pickup/dropoff lon/lat derived from PULocationID/DOLocationID."""
+    if "pickup_longitude" in df.columns:
+        return df
+    if "PULocationID" not in df.columns or "DOLocationID" not in df.columns:
+        logger.warning("No lat/lon and no LocationID columns; cannot synthesize coordinates")
+        return df
+
+    logger.info("Synthesizing pickup/dropoff lat-lon from PULocationID/DOLocationID")
+    df = df.withColumn("pickup_longitude", _coord_from_id("PULocationID", "lon", NYC_LON_MIN, NYC_LON_MAX))
+    df = df.withColumn("pickup_latitude",  _coord_from_id("PULocationID", "lat", NYC_LAT_MIN, NYC_LAT_MAX))
+    df = df.withColumn("dropoff_longitude", _coord_from_id("DOLocationID", "lon", NYC_LON_MIN, NYC_LON_MAX))
+    df = df.withColumn("dropoff_latitude",  _coord_from_id("DOLocationID", "lat", NYC_LAT_MIN, NYC_LAT_MAX))
+    return df
+
 
 def build_spark(app_name: str = "mobility-ingest") -> SparkSession:
     return (
@@ -80,6 +112,8 @@ def adapt_schema(df):
     for src, dst in available.items():
         if src != dst:
             df = df.withColumnRenamed(src, dst)
+
+    df = synthesize_coords(df)
 
     df = df.withColumn(
         "trip_id",
