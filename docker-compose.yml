@@ -1,0 +1,226 @@
+version: '3.8'
+
+# ─────────────────────────────────────────
+#  ANCHORS
+# ─────────────────────────────────────────
+x-spark-worker: &spark-worker
+  image: bitnami/spark:3.5
+  environment:
+    - SPARK_MODE=worker
+    - SPARK_MASTER_URL=spark://mobility-spark-master:7077
+    - SPARK_WORKER_MEMORY=3G
+    - SPARK_WORKER_CORES=2
+    - SPARK_RPC_AUTHENTICATION_ENABLED=no
+    - SPARK_RPC_ENCRYPTION_ENABLED=no
+    - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+    - SPARK_SSL_ENABLED=no
+  volumes:
+    - ./jobs:/opt/bitnami/spark/jobs
+    - ./data:/opt/bitnami/spark/data
+  depends_on:
+    - mobility-spark-master
+  networks:
+    - mobility-net
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.1-python3.11
+  environment:
+    - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@mobility-postgres/airflow
+    - AIRFLOW__CORE__FERNET_KEY=${FERNET_KEY:-}
+    - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+    - AIRFLOW__CORE__LOAD_EXAMPLES=false
+    - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth
+    - AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK=true
+    - PYTHONPATH=/opt/airflow/plugins
+    - SPARK_MASTER=spark://mobility-spark-master:7077
+    - MONGO_URI=mongodb://admin:admin@mobility-mongodb:27017/
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./jobs:/opt/airflow/jobs
+    - ./data:/opt/airflow/data
+  depends_on:
+    mobility-postgres:
+      condition: service_healthy
+  networks:
+    - mobility-net
+
+# ─────────────────────────────────────────
+#  SERVICES
+# ─────────────────────────────────────────
+services:
+
+  # ── Spark Cluster ──────────────────────────────────────────
+  mobility-spark-master:
+    image: bitnami/spark:3.5
+    container_name: mobility-spark-master
+    hostname: mobility-spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./jobs:/opt/bitnami/spark/jobs
+      - ./data:/opt/bitnami/spark/data
+    networks:
+      - mobility-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  mobility-spark-worker-1:
+    <<: *spark-worker
+    container_name: mobility-spark-worker-1
+    hostname: mobility-spark-worker-1
+    ports:
+      - "8081:8081"
+
+  mobility-spark-worker-2:
+    <<: *spark-worker
+    container_name: mobility-spark-worker-2
+    hostname: mobility-spark-worker-2
+    ports:
+      - "8082:8081"
+
+  # ── Airflow metadata DB ────────────────────────────────────
+  mobility-postgres:
+    image: postgres:15-alpine
+    container_name: mobility-postgres
+    hostname: mobility-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - mobility-postgres-data:/var/lib/postgresql/data
+    networks:
+      - mobility-net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Airflow init ───────────────────────────────────────────
+  mobility-airflow-init:
+    <<: *airflow-common
+    container_name: mobility-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        pip install apache-airflow-providers-apache-spark pymongo --quiet
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@local.dev \
+          --password admin || true
+        echo "Init complete"
+    restart: on-failure
+
+  mobility-airflow-webserver:
+    <<: *airflow-common
+    container_name: mobility-airflow-webserver
+    command: webserver
+    ports:
+      - "8090:8080"
+    depends_on:
+      mobility-airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  mobility-airflow-scheduler:
+    <<: *airflow-common
+    container_name: mobility-airflow-scheduler
+    command: scheduler
+    depends_on:
+      mobility-airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ── MongoDB ────────────────────────────────────────────────
+  mobility-mongodb:
+    image: mongo:7
+    container_name: mobility-mongodb
+    hostname: mobility-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin
+      MONGO_INITDB_DATABASE: mobility
+    ports:
+      - "27017:27017"
+    volumes:
+      - mobility-mongo-data:/data/db
+    networks:
+      - mobility-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ── Streamlit ──────────────────────────────────────────────
+  mobility-streamlit:
+    build:
+      context: ./streamlit
+      dockerfile: Dockerfile
+    container_name: mobility-streamlit
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./streamlit:/app
+    environment:
+      - MONGO_URI=mongodb://admin:admin@mobility-mongodb:27017/
+      - MONGO_DB=mobility
+    depends_on:
+      mobility-mongodb:
+        condition: service_healthy
+    networks:
+      - mobility-net
+    restart: unless-stopped
+
+  # ── Jupyter ────────────────────────────────────────────────
+  mobility-jupyter:
+    image: jupyter/pyspark-notebook:spark-3.5.0
+    container_name: mobility-jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - SPARK_MASTER=spark://mobility-spark-master:7077
+      - MONGO_URI=mongodb://admin:admin@mobility-mongodb:27017/
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./data:/home/jovyan/data
+    depends_on:
+      - mobility-spark-master
+    networks:
+      - mobility-net
+
+# ─────────────────────────────────────────
+#  VOLUMES & NETWORKS
+# ─────────────────────────────────────────
+volumes:
+  mobility-postgres-data:
+  mobility-mongo-data:
+
+networks:
+  mobility-net:
+    driver: bridge

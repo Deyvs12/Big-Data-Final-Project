@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Spark / Hadoop
+spark-warehouse/
+metastore_db/
+derby.log
+.spark-staging-*
+
+# Data (kept tracked: zones.csv only)
+data/raw/
+data/bronze/
+data/silver/
+data/gold/
+data/*.parquet
+data/*.csv.gz
+!data/zones.csv
+
+# Airflow
+airflow/logs/
+airflow/plugins/__pycache__/
+!airflow/logs/.gitkeep
+!airflow/plugins/.gitkeep
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
