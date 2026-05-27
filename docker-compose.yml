@@ -220,7 +220,10 @@ services:
 
   # ── Jupyter ────────────────────────────────────────────────
   mobility-jupyter:
-    image: jupyter/pyspark-notebook:spark-3.5.0
+    build:
+      context: ./notebooks
+      dockerfile: Dockerfile
+    image: mobility-jupyter:3.5.1
     container_name: mobility-jupyter
     ports:
       - "8888:8888"
