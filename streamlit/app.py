@@ -8,11 +8,12 @@ from __future__ import annotations
 import logging
 import os
 
+import folium
 import pandas as pd
 import plotly.express as px
-import pydeck as pdk
 import streamlit as st
 from pymongo import MongoClient
+from streamlit_folium import st_folium
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -225,7 +226,7 @@ def duration_tab():
 
 
 def heatmap_tab():
-    st.subheader("Mapa de calor por zona")
+    st.subheader("Mapa de actividad por zona")
     df = load_collection("revenue_by_zone")
     if df.empty:
         st.info("Sin datos.")
@@ -240,18 +241,35 @@ def heatmap_tab():
         st.warning("Las zonas en MongoDB no coinciden con los centroides conocidos.")
         return
 
-    max_trips = max(df["trips"].max(), 1)
-    df["weight"] = df["trips"] / max_trips
+    # Folium = Leaflet tiles, no WebGL needed (works in any browser/VM).
+    m = folium.Map(location=[40.74, -73.95], zoom_start=10, tiles="OpenStreetMap")
 
-    layer = pdk.Layer(
-        "HeatmapLayer",
-        data=df,
-        get_position="[lon, lat]",
-        get_weight="weight",
-        radiusPixels=80,
-    )
-    view = pdk.ViewState(latitude=40.74, longitude=-73.95, zoom=10, pitch=0)
-    st.pydeck_chart(pdk.Deck(map_style="light", initial_view_state=view, layers=[layer]))
+    max_trips = max(df["trips"].max(), 1)
+    for _, row in df.iterrows():
+        # Marker radius in pixels: 8 (smallest zone) to 40 (busiest)
+        radius_px = 8 + (row["trips"] / max_trips) * 32
+        popup_html = (
+            f"<b>{row['pickup_zone']}</b><br>"
+            f"Viajes: {int(row['trips']):,}<br>"
+            f"Ingresos: ${row['total_fare']:,.0f}<br>"
+            f"Ticket promedio: ${row['avg_fare']:.2f}"
+        )
+        folium.CircleMarker(
+            location=[row["lat"], row["lon"]],
+            radius=radius_px,
+            popup=folium.Popup(popup_html, max_width=260),
+            tooltip=row["pickup_zone"],
+            color="#ff6400",
+            weight=1.5,
+            fill=True,
+            fill_color="#ff6400",
+            fill_opacity=0.55,
+        ).add_to(m)
+
+    st_folium(m, width=None, height=500, returned_objects=[])
+
+    st.caption("🟠 Tamaño del círculo proporcional al volumen de viajes. "
+               "Haz click en una zona para ver detalles.")
 
     st.markdown("**Detalles**")
     st.dataframe(df[["pickup_zone", "trips", "total_fare", "avg_fare"]],
