@@ -17,6 +17,7 @@ import logging
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,10 +42,14 @@ def load_zones(spark, path: str):
 
 
 def assign_zone(trips, zones, lon_col: str, lat_col: str, out_col: str):
-    """Cross-join trips with zones and keep matching bounding box.
+    """Attach the matching zone to each trip via a broadcast bbox join.
 
-    Zone table is tiny (~12 rows), so a broadcast join is fine.
+    Multiple zones may overlap a single point (e.g. LaGuardia bbox sits inside
+    Queens). We resolve ties by keeping the zone with the lowest ``priority``
+    (1 = airports/specific, 2 = generic borough). Zones table is tiny (~12
+    rows) so the broadcast join + window dedup is cheap.
     """
+    pri_col = f"_pri_{out_col}"
     zones_b = F.broadcast(
         zones.select(
             F.col("zone_id").alias(f"{out_col}_id"),
@@ -53,6 +58,7 @@ def assign_zone(trips, zones, lon_col: str, lat_col: str, out_col: str):
             F.col("max_longitude").alias("_max_lon"),
             F.col("min_latitude").alias("_min_lat"),
             F.col("max_latitude").alias("_max_lat"),
+            F.col("priority").alias(pri_col),
         )
     )
     joined = trips.join(
@@ -63,8 +69,17 @@ def assign_zone(trips, zones, lon_col: str, lat_col: str, out_col: str):
         & (F.col(lat_col) < F.col("_max_lat")),
         how="left",
     )
+
+    # When a point matches multiple zones, keep the most specific one.
+    rank_col = f"_rank_{out_col}"
+    w = Window.partitionBy("trip_id").orderBy(F.col(pri_col).asc_nulls_last())
+    joined = (joined
+              .withColumn(rank_col, F.row_number().over(w))
+              .filter(F.col(rank_col) == 1)
+              .drop(rank_col, pri_col, "_min_lon", "_max_lon", "_min_lat", "_max_lat"))
+
     joined = joined.fillna({out_col: "Desconocida"})
-    return joined.drop("_min_lon", "_max_lon", "_min_lat", "_max_lat")
+    return joined
 
 
 def run(trips_path: str, zones_path: str, output_path: str) -> None:

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_URL = os.environ.get(
     "TLC_PARQUET_URL",
-    "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2015-06.parquet",
+    "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2025-06.parquet",
 )
 DEFAULT_OUTPUT = Path(__file__).parent / "raw" / "yellow_tripdata.parquet"
 

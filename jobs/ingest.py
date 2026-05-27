@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -50,10 +51,50 @@ PAYMENT_TYPE_MAP = {
 
 # TLC retroactively republished pre-2016-07 parquets with PULocationID /
 # DOLocationID instead of pickup/dropoff lon-lat. The project schema requires
-# lat/lon, so when only LocationIDs are present we synthesize deterministic
-# coordinates inside a rough NYC bounding box.
+# lat/lon, so we attach coordinates via either:
+#   1. Real TLC zone centroids loaded from data/taxi_zone_centroids.csv (preferred)
+#   2. Deterministic hash-based synthesis inside a rough NYC bounding box (fallback)
+TLC_CENTROIDS_DEFAULT_PATH = "/opt/bitnami/spark/data/taxi_zone_centroids.csv"
 NYC_LON_MIN, NYC_LON_MAX = -74.25, -73.70
 NYC_LAT_MIN, NYC_LAT_MAX = 40.50, 40.92
+
+
+def lookup_real_coords(df, spark, centroids_path: str = TLC_CENTROIDS_DEFAULT_PATH):
+    """Attach lat/lon by joining PULocationID/DOLocationID to TLC zone centroids.
+
+    Falls back to ``synthesize_coords`` if the centroids file is missing or
+    unreadable. Returns df unchanged when lat/lon are already present.
+    """
+    if "pickup_longitude" in df.columns:
+        return df
+    if "PULocationID" not in df.columns or "DOLocationID" not in df.columns:
+        logger.warning("No lat/lon and no LocationID columns; cannot assign coordinates")
+        return df
+
+    if not os.path.exists(centroids_path):
+        logger.warning("Centroids file not found at %s; falling back to synthetic coords",
+                       centroids_path)
+        return synthesize_coords(df)
+
+    centroids = (spark.read
+                      .option("header", True)
+                      .option("inferSchema", True)
+                      .csv(centroids_path))
+    logger.info("Loaded %d zone centroids from %s", centroids.count(), centroids_path)
+
+    pickup_c = centroids.select(
+        F.col("location_id").alias("PULocationID"),
+        F.col("longitude").alias("pickup_longitude"),
+        F.col("latitude").alias("pickup_latitude"),
+    )
+    dropoff_c = centroids.select(
+        F.col("location_id").alias("DOLocationID"),
+        F.col("longitude").alias("dropoff_longitude"),
+        F.col("latitude").alias("dropoff_latitude"),
+    )
+    df = df.join(F.broadcast(pickup_c), "PULocationID", "left")
+    df = df.join(F.broadcast(dropoff_c), "DOLocationID", "left")
+    return df
 
 
 def _coord_from_id(id_col, salt: str, lo: float, hi: float):
@@ -89,7 +130,7 @@ def build_spark(app_name: str = "mobility-ingest") -> SparkSession:
     )
 
 
-def adapt_schema(df):
+def adapt_schema(df, spark):
     """Rename TLC columns and convert units to project schema."""
     rename_map = {
         "tpep_pickup_datetime": "pickup_datetime",
@@ -113,7 +154,7 @@ def adapt_schema(df):
         if src != dst:
             df = df.withColumnRenamed(src, dst)
 
-    df = synthesize_coords(df)
+    df = lookup_real_coords(df, spark)
 
     df = df.withColumn(
         "trip_id",
@@ -157,7 +198,7 @@ def run(input_path: str, output_path: str) -> None:
     raw = spark.read.parquet(input_path)
     logger.info("Raw row count: %d, columns: %s", raw.count(), raw.columns)
 
-    adapted = adapt_schema(raw)
+    adapted = adapt_schema(raw, spark)
     n_out = adapted.count()
     logger.info("Adapted row count: %d", n_out)
     adapted.printSchema()
