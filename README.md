@@ -1,23 +1,27 @@
 # Análisis de Patrones de Movilidad Urbana
 
-Proyecto final de Big Data: pipeline PySpark + Airflow + MongoDB + Streamlit
-sobre el dataset **NYC TLC Yellow Taxi** para responder:
+Pipeline ETL completo con **PySpark + Airflow + MongoDB + Streamlit** sobre el
+dataset *NYC TLC Yellow Taxi* para responder:
 
 - ¿En qué horarios hay más demanda?
 - ¿Qué zonas generan más viajes de origen / destino?
 - ¿Cuál es la duración promedio por franja horaria?
 - ¿Cómo varía el ingreso por zona y día de la semana?
 
+---
+
 ## Stack
 
 | Componente | Tecnología | Puerto |
 |---|---|---|
-| Procesamiento | PySpark 3.5 (1 master + 2 workers) | 8080 |
+| Procesamiento | PySpark 3.5.1 (1 master + 2 workers) | 8080 |
 | Orquestación | Apache Airflow 2.9.1 | 8090 |
-| Almacenamiento | MongoDB 7 | 27017 |
+| Almacenamiento analítico | MongoDB 7 | 27017 |
 | Visualización | Streamlit | 8501 |
-| Exploración | Jupyter (PySpark) | 8888 |
+| Exploración interactiva | Jupyter Lab (PySpark 3.5.1) | 8888 |
 | Metadata Airflow | PostgreSQL 15 | — |
+
+---
 
 ## Estructura
 
@@ -25,25 +29,36 @@ sobre el dataset **NYC TLC Yellow Taxi** para responder:
 .
 ├── docker-compose.yml
 ├── .env.example
+├── reset.py                       # limpia bronze/silver/gold + MongoDB + DAG history
+│
+├── airflow/
+│   ├── Dockerfile                 # Airflow + Java JRE + providers (constraints)
+│   └── dags/mobility_pipeline.py
+│
 ├── data/
-│   ├── zones.csv               # 12 zonas NYC con bounding boxes
-│   └── download_tlc_data.py    # baja yellow_tripdata_2016-06.parquet
-├── jobs/                       # scripts PySpark
-│   ├── ingest.py               # adapta schema TLC -> schema proyecto
-│   ├── clean.py                # nulls, casts, derivadas, outliers
-│   ├── enrich.py               # join por bbox -> pickup/dropoff_zone
-│   ├── analysis.py             # 8 agregaciones gold
-│   └── export_to_mongo.py      # parquet -> MongoDB
-├── airflow/dags/
-│   └── mobility_pipeline.py    # DAG en cadena
-├── streamlit/
-│   ├── app.py                  # 7 pestañas
-│   ├── Dockerfile
-│   └── requirements.txt
-└── notebooks/
-    ├── 01_exploration.ipynb
-    └── 02_analysis_results.ipynb
+│   ├── zones.csv                  # 12 zonas NYC con bbox + priority
+│   ├── taxi_zone_centroids.csv    # 263 centroides reales del shapefile TLC
+│   └── download_tlc_data.py       # descarga y samplea el parquet TLC
+│
+├── jobs/                          # scripts PySpark
+│   ├── ingest.py                  # adapta schema TLC -> schema proyecto
+│   ├── clean.py                   # nulls, casts, derivadas, outliers
+│   ├── enrich.py                  # join por bbox -> pickup/dropoff_zone
+│   ├── analysis.py                # 8 agregaciones gold
+│   └── export_to_mongo.py         # parquet -> MongoDB
+│
+├── notebooks/
+│   ├── Dockerfile                 # PySpark 3.5.1 + pymongo + plotly
+│   ├── 01_exploration.ipynb       # EDA con PySpark local
+│   └── 02_analysis_results.ipynb  # resultados finales
+│
+└── streamlit/
+    ├── Dockerfile
+    ├── requirements.txt
+    └── app.py                     # 7 pestañas, lee de MongoDB
 ```
+
+---
 
 ## Schema del pipeline
 
@@ -81,79 +96,129 @@ Outliers descartados:
 7. `avg_duration_by_zone`
 8. `revenue_by_payment_type`
 
-## Arranque
+---
+
+## Pre-requisitos
+
+- **Docker** + **Docker Compose** v2
+- **Python 3.10+** en el host (solo para `download_tlc_data.py` y `reset.py`)
+- Opcional pero recomendado: `pip install --user pyarrow` para que
+  el sampleo del dataset funcione en el host
+
+---
+
+## Arranque (primera vez)
 
 ### 1. Configuración inicial
 
 ```bash
 cp .env.example .env
-# Genera una Fernet key:
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+# Genera una Fernet key para Airflow:
+python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # Pega el resultado como FERNET_KEY en .env
 ```
 
-### 2. Levantar stack
+> Si tu UID del host no es 1000, edita `.env` y agrega `HOST_UID=$(id -u)`.
+
+### 2. Descargar dataset
 
 ```bash
-docker compose up -d
+python3 data/download_tlc_data.py --fraction 0.05
+```
+
+Baja `yellow_tripdata_2015-06.parquet` (~170 MB) y deja una muestra del 5%
+(~13 MB, ~600k filas) en `data/raw/`. La URL se puede cambiar via
+`TLC_PARQUET_URL` en `.env`.
+
+> ⚠️ Si ves `pyarrow not installed; skipping sampling`, el archivo queda
+> completo (170 MB) en vez de samplado. Para arreglarlo: `pip install --user pyarrow`
+> y re-corre el script (no re-descarga, solo samplea in-place).
+
+### 3. Levantar stack
+
+```bash
+docker compose up -d --build
+```
+
+Primera vez tarda 5–10 min porque construye las imágenes custom de Airflow,
+Jupyter y Streamlit. Subsecuentes arranques son instantáneos.
+
+Verifica estado:
+```bash
 docker compose ps
 ```
 
-UIs disponibles:
-- Spark Master: http://localhost:8080
-- Airflow:      http://localhost:8090   (admin / admin)
-- Streamlit:    http://localhost:8501
-- Jupyter:      http://localhost:8888   (token en `docker compose logs mobility-jupyter`)
-- MongoDB:      `mongodb://admin:admin@localhost:27017/`
+Todos los containers deben aparecer `Up` (algunos como `healthy`). El init
+de Airflow corre una sola vez y termina con `Exited (0)` — es normal.
 
-### 3. Descargar dataset (una sola vez)
+### 4. Ejecutar el pipeline
+
+Abre **Airflow** en http://localhost:8090 (`admin` / `admin`).
+
+1. En la lista de DAGs, click en `mobility_pipeline`
+2. Click en el toggle ☑️ para activarlo (unpause)
+3. Click en el botón ▶️ **Trigger DAG** arriba a la derecha
+4. (Opcional) Vista **Graph** para ver la cadena en tiempo real:
+   `ingest → clean → enrich → analysis → export_to_mongo`
+
+> La conexión `spark_default` (Spark master) se crea automáticamente al
+> primer arranque por el init container. No necesitas configurarla a mano.
+
+Tiempo total del run: ~3–8 minutos con el sample al 5%.
+
+### 5. Ver resultados
+
+| Dónde | URL | Qué muestra |
+|---|---|---|
+| **Streamlit** | http://localhost:8501 | Dashboard con 7 pestañas (gráficas + mapa) |
+| **Jupyter** | http://localhost:8888 | Notebooks de exploración. Token: `docker compose logs mobility-jupyter \| grep token` |
+| **MongoDB shell** | — | `docker exec -it mobility-mongodb mongosh -u admin -p admin` |
+| **Spark Master UI** | http://localhost:8080 | Estado del cluster y jobs |
+
+Consulta MongoDB directo:
+```javascript
+use mobility
+show collections
+db.demand_by_hour.find().sort({hour_of_day: 1}).limit(5)
+```
+
+---
+
+## Resetear el proyecto
+
+Para volver a un estado limpio:
 
 ```bash
-python data/download_tlc_data.py --fraction 0.05
+python3 reset.py --yes
 ```
 
-Esto baja `yellow_tripdata_2016-06.parquet` (último mes con lat/lon en TLC)
-y deja una muestra del 5% en `data/raw/`.
-
-### 4. Conexión Spark en Airflow
-
-En la UI de Airflow → **Admin → Connections** crea / edita `spark_default`:
-
-```
-Conn Id   : spark_default
-Conn Type : Spark
-Host      : spark://mobility-spark-master
-Port      : 7077
-```
-
-### 5. Ejecutar pipeline
-
-Airflow UI → DAGs → `mobility_pipeline` → ☑️ unpause → ▶️ trigger.
-
-Etapas: `ingest → clean → enrich → analysis → export_to_mongo`.
-
-### 6. Ver resultados
-
-- Streamlit: http://localhost:8501
-- Notebooks: http://localhost:8888 → `02_analysis_results.ipynb`
-- MongoDB shell:
-
-  ```bash
-  docker exec -it mobility-mongodb mongosh -u admin -p admin
-  use mobility
-  show collections
-  db.demand_by_hour.find().sort({hour_of_day: 1}).limit(5)
-  ```
-
-## Ejecutar un job suelto sin Airflow
+Borra `data/bronze/silver/gold/`, todas las colecciones de MongoDB, el
+historial de runs del DAG y los `__pycache__/`. **No** borra el parquet
+descargado en `data/raw/`. Para borrar también el parquet:
 
 ```bash
-docker exec -it mobility-spark-master spark-submit \
+python3 reset.py --raw --yes
+```
+
+---
+
+## Ejecutar un job suelto (sin Airflow)
+
+Útil para debugging:
+
+```bash
+docker exec mobility-spark-master spark-submit \
   --master spark://mobility-spark-master:7077 \
   /opt/bitnami/spark/jobs/analysis.py
 ```
 
-## Convenciones
+Cada job acepta `--input` y `--output` como argumentos. Ver el docstring
+de cada `jobs/*.py` para los defaults.
+
+---
+
+## Convenciones del código
 
 - `SparkSession.builder.getOrCreate()` — nunca crear una sesión nueva.
 - Rutas dentro de contenedores Spark: `/opt/bitnami/spark/data/`.
@@ -161,9 +226,24 @@ docker exec -it mobility-spark-master spark-submit \
 - MongoDB se escribe vía `pandas` + `pymongo` tras agregar con PySpark.
 - Credenciales sólo vía `.env` / variables de entorno, nunca hardcoded.
 
+---
+
 ## Apagar
 
 ```bash
-docker compose down            # conserva volúmenes
-docker compose down -v         # borra Mongo + Postgres + datos generados
+docker compose down            # conserva volúmenes (Mongo, Postgres)
+docker compose down -v         # también borra los volúmenes
 ```
+
+---
+
+## Troubleshooting
+
+| Síntoma | Solución |
+|---|---|
+| Puertos 8080/8090/8501/8888 ya en uso | Detén otros stacks Docker o cambia los puertos en `docker-compose.yml` |
+| Init de Airflow en loop de restart | Verifica logs: `docker compose logs mobility-airflow-init`. Probable falta de Fernet key. |
+| DAG falla con `Permission denied` en `data/` | Confirma que tu UID es 1000 o pasa `HOST_UID=$(id -u)` en `.env` |
+| Streamlit muestra "Sin datos" en todas las pestañas | El DAG no ha terminado o falló `export_to_mongo`. Revisa logs en Airflow. |
+| Jupyter notebook 01 falla con `FileNotFoundException` | Ejecuta primero al menos la tarea `ingest` del DAG |
+| Spark UI vacío | `docker compose restart mobility-spark-master mobility-spark-worker-1 mobility-spark-worker-2` |
